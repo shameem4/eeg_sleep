@@ -6,7 +6,7 @@ I built a system that reads a single channel of EEG from any device -- scalp ele
 
 17 datasets. 2,293 subjects. 5 device types. 2.67 million 30-second epochs. One model.
 
-Cohen's kappa: 0.765. Macro F1: 0.777. On a fully cross-subject, cross-device test set.
+Cohen's kappa: 0.768. Macro F1: 0.777. On a fully cross-subject, cross-device test set.
 
 For context, human sleep scorers agree with each other at kappa 0.76 (95% CI 0.71-0.81). This system matches that ceiling, from a single EEG channel, across devices it may not have seen before.
 
@@ -104,17 +104,17 @@ Hardware: RTX 5060 Ti (16GB), Ryzen 9 9950X3D, 64GB RAM. Encoder training: ~2 ho
 
 | Stage | F1 Score | Recall | Precision |
 |-------|----------|--------|-----------|
-| Wake | 0.932 | - | - |
-| N1 | 0.535 | - | - |
-| N2 | 0.820 | - | - |
-| N3 | 0.753 | - | - |
+| Wake | 0.937 | - | - |
+| N1 | 0.530 | - | - |
+| N2 | 0.823 | - | - |
+| N3 | 0.751 | - | - |
 | REM | 0.844 | - | - |
 | **Overall** | **0.777** | - | - |
 
-Cohen's kappa: 0.765. Accuracy: 0.779.
+Cohen's kappa: 0.768. Accuracy: 0.832.
 
 ![Per-Stage F1](plots/article/02_per_stage_f1.png)
-*Per-stage F1 (solid) vs human inter-rater kappa (hatched). N1 is hardest for both humans (0.24) and machines (0.535). The difficulty ranking is preserved: W > REM > N2 > N3 > N1.*
+*Per-stage F1 (solid) vs human inter-rater kappa (hatched). N1 is hardest for both humans (0.24) and machines (0.530). The difficulty ranking is preserved: W > REM > N2 > N3 > N1.*
 
 ### Comparison to Published Work
 
@@ -124,7 +124,7 @@ Cohen's kappa: 0.765. Accuracy: 0.779.
 | ZleepAnlystNet | 2024 | SHHS -> SleepEDF OOD | 0.779 | Single-channel |
 | U-Sleep | 2021 | 15,660 subj (16 ds), multi-ch | 0.819 median | EEG + EOG |
 | SOMNUS ensemble | 2025 | 27,494 subj (15 ds), multi-ch | 0.85-0.89 | Multi-channel ensemble |
-| **This work** | **2026** | **2,293 subj (17 ds), single-ch** | **0.765** | **5 device types, device-agnostic** |
+| **This work** | **2026** | **2,293 subj (17 ds), single-ch** | **0.768** | **5 device types, device-agnostic** |
 
 The single-channel constraint is deliberate. Ear-EEG devices, the target deployment platform, provide one channel. We match the human inter-rater ceiling under this constraint.
 
@@ -213,7 +213,7 @@ In rough order of impact:
 
 ## The N1 Problem
 
-N1 (light sleep onset) is the hardest stage for both humans and machines. Human inter-rater kappa on N1 is 0.24 -- barely above chance. Our N1 F1 of 0.535 is in line with every published system's N1 performance.
+N1 (light sleep onset) is the hardest stage for both humans and machines. Human inter-rater kappa on N1 is 0.24 -- barely above chance. Our N1 F1 of 0.530 is in line with every published system's N1 performance.
 
 Why N1 is hard:
 - It is rare (typically 5-10% of total sleep time)

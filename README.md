@@ -2,7 +2,7 @@
 
 Device-agnostic single-channel EEG sleep staging at human expert-level agreement.
 
-**Cohen's kappa: 0.765 | Macro F1: 0.777 | 17 datasets | 2,293 subjects | 5 device types**
+**Cohen's kappa: 0.768 | Macro F1: 0.777 | 17 datasets | 2,293 subjects | 5 device types**
 
 Human inter-rater agreement: kappa 0.76 (95% CI 0.71-0.81). This system matches that ceiling from a single EEG channel across scalp, in-ear, around-ear, headband, and forehead devices.
 
@@ -42,10 +42,10 @@ Key finding: CNN branches encode device-specific waveform morphology. Dropping t
 
 | Stage | F1 | Human kappa |
 |-------|----|-------------|
-| W | 0.932 | 0.70 |
-| N1 | 0.535 | 0.24 |
-| N2 | 0.820 | 0.57 |
-| N3 | 0.753 | 0.57 |
+| W | 0.937 | 0.70 |
+| N1 | 0.530 | 0.24 |
+| N2 | 0.823 | 0.57 |
+| N3 | 0.751 | 0.57 |
 | REM | 0.844 | 0.69 |
 
 ![Per-Stage F1](plots/article/02_per_stage_f1.png)

@@ -1101,3 +1101,29 @@ for EEG. Key ideas:
 - Keeps spectral+STFT feature extractors, HDF5 data pipeline from eeg_sleep
 - Discards reconstruction decoders, CRF, per-epoch isolation
 File: C:\Users\shame\OneDrive\Desktop\eeg_stuff\eeg_jepa\PROMPT.md
+
+2026-03-01: Final model training (--exp-name final)
+================================================================
+Root cause of training collapse identified: AttentionPool softmax saturation at epoch 12.
+Both runs with AttentionPool (attn_pool, f1_baseline) collapsed identically at epoch 12.
+Baseline without AttentionPool never collapsed.
+
+Fix: Removed AttentionPool class, reverted STFT to mean pooling.
+Reverted monitoring from val_f1_macro to val_kappa.
+
+Final model: spectral+STFT mean pooled (256d) -> BiGRU(384) -> shared head (768->128->5) + CRF
+Training: 16 epochs, stable throughout, no collapse. Best val_kappa=0.774 at epoch 11.
+Checkpoint: checkpoints/sleep_model/final/epoch=11-val_kappa=0.774.ckpt
+
+Test results (335 subjects, 17 datasets):
+  kappa=0.768, F1=0.777, acc=0.832
+  W=0.937, N1=0.530, N2=0.823, N3=0.751, REM=0.844
+
+Delta vs gru384 (pre-simplification best):
+  kappa: -0.004 (expected from N1Aux removal)
+  F1: -0.002
+  N1 F1: -0.007
+
+Architecture is now locked and simplified. Project complete.
+Article: ARTICLE.md, README: README.md, Figures: plots/article/ (10 figures)
+Next: eeg_jepa (JEPA-based successor, see C:\Users\shame\OneDrive\Desktop\eeg_stuff\eeg_jepa\PROMPT.md)

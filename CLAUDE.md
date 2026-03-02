@@ -14,8 +14,7 @@ Subject/device-agnostic single-channel EEG sleep stage classifier for in-ear ear
 - Output: 640d concatenated features (128*3 + 128 + 128)
 
 **SleepStageNet** (~5.3M params, 4.2M trainable):
-- EpochEncoder (frozen) -> spectral (mean pool) + STFT (attention pool) = 256d, CNN branches skipped
-- AttentionPool: learned weighted average over 31 STFT time frames (129 params, temperature-scaled)
+- EpochEncoder (frozen) -> spectral + STFT (both mean pooled) = 256d, CNN branches skipped
 - 2-layer BiGRU (input=256d, hidden=384, bidirectional)
 - Shared MLP head: Dropout -> LayerNorm(768) -> Linear(768,128) -> GELU -> Linear(128,5)
 - CRF on top of logits
@@ -47,8 +46,9 @@ All training/eval scripts support `--exp-name <name>` (default: "default").
 Checkpoints in `checkpoints/{encoder|sleep_model}/<exp_name>/`, logs in `logs/{encoder|sleep_model}/<exp_name>/`.
 
 ## Best Checkpoints
-- attn_pool: test kappa=0.768, F1=0.779, N1 F1=0.540, acc=0.789 (attention pool + wider head)
-  Checkpoint: checkpoints/sleep_model/attn_pool/epoch=9-val_kappa=0.771.ckpt
+- final: test kappa=0.768, F1=0.777, N1 F1=0.530, acc=0.832 (simplified, mean pooled)
+  Checkpoint: checkpoints/sleep_model/final/epoch=11-val_kappa=0.774.ckpt
+  Per-class F1: W=0.937, N1=0.530, N2=0.823, N3=0.751, REM=0.844
 - Encoder: checkpoints/encoder/v12/epoch=49-val_loss=0.627.ckpt
 
 ## Data
@@ -97,6 +97,7 @@ Sanitize caches: `python data_pipeline.py --sanitize` (or `--audit` for dry run)
 - Per-stage heads (5x [768->64->1]): 246K params, hurts N1 F1 -0.019 vs shared head; redundant LayerNorm+Dropout per stage; shared 768->64->5 head is both smaller and better
 - Directional STFT pool + delta features: N1 F1 -0.043; lossy projections (512->256) destroyed information, epoch-to-epoch deltas are noise-dominated (artifacts, impedance), frozen transformer tokens lack temporal ordering after self-attention
 - No CRF: N1 F1 +0.011 but kappa -0.009, N2 F1 -0.014; CRF's N1 penalty reduced to -0.006 with attention pooling (was -0.020)
+- AttentionPool on STFT: training collapse at epoch 12 (attention weight saturation in softmax); temperature scaling defers but doesn't prevent; mean pooling is stable and equivalent
 
 ## Reconstruction Decoders (training-only, discarded after encoder training)
 | Decoder | Input | Target | Output | Params |
