@@ -36,6 +36,8 @@ Two-stage pipeline: unsupervised encoder (no labels) followed by frozen-encoder 
 
 Key finding: CNN branches encode device-specific waveform morphology. Dropping them from downstream improved cross-device generalization (+0.005 kappa, +0.025 N1 F1).
 
+![Branch N1 Discriminability](plots/article/06_branch_n1.png)
+
 ## Results
 
 | Stage | F1 | Human kappa |
