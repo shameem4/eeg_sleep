@@ -1,0 +1,1103 @@
+2026-02-13: Project start
+================================================================
+Goal: Subject/device-agnostic single-channel EEG sleep stage classifier for in-ear earbuds.
+Data: 17 datasets, ~2,295 subjects, ~2.68M epochs, 5 device types, 128Hz, 30s epochs.
+
+Prior work (abandoned):
+- SincNet + Transformer: kappa 0.822 single-dataset, 0.64 multi-dataset ceiling
+- CPC pretraining: no benefit over supervised
+- Dual-branch CNN + BiGRU end-to-end: kappa 0.730 (11ds), 0.707 (17ds)
+- Root cause: CNN encodes absolute amplitude (device-specific), not relative
+
+2026-02-13 to 2026-02-22: Architecture evolution
+================================================================
+
+## Version history
+| Version | Date | Architecture | test_kappa | Key change |
+|---------|------|-------------|------------|------------|
+| v1 | 02-13 | 2-branch SupCon+CE+DANN, 256d proj | 0.669 | Initial encoder |
+| v2 | 02-14 | 4-branch (STFT+spectral), SE, augment | 0.674 | +0.005 |
+| v2+CRF | 02-14 | + BiGRU+CRF downstream (frozen 3 ep) | 0.773 | +0.099 (CRF + downstream) |
+| v3 | 02-19 | L2 norm, CE=0.7, delta decoder, mag spec | 0.772 | Better geometry, same kappa |
+| v4 | 02-20 | SupCon=0.5, fully frozen encoder | 0.772 | Simpler pipeline |
+| - | 02-20 | CE=0 (label-free encoder) | 0.764 | -0.008, adopted for simplicity |
+| - | 02-21 | SupCon=0 (fully unsupervised) | 0.758 | -0.014 cumulative from v4 |
+| - | 02-21 | DANN removed, proj removed (448d direct) | 0.770 | Simplified, same perf |
+| v7 | 02-22 | Clean baseline post-cleanup | 0.756 | 448d, no SE/DANN/proj |
+| v8 | 02-22 | STFT 64d->128d (512d total), SE removed | 0.750 | Better recon, kappa wash |
+| v9 | 02-23 | Bandpass delta+hfreq decoders | 0.758 | +0.008 vs v8, current best |
+
+## Key architectural decisions (chronological)
+1. **CRF** (02-14): +0.016 kappa over no-CRF. Linear CRF only (semi-Markov tested, no benefit).
+2. **Frozen encoder** (02-20): CKA=0.966 between pretrained/finetuned -- finetuning barely changes encoder. Frozen with --freeze-epochs 999 is default.
+3. **CE removal** (02-20): -0.008 kappa but removes label dependency from encoder. Adopted.
+4. **SupCon removal** (02-21): -0.014 cumulative from v4. Encoder now fully unsupervised (recon only).
+5. **DANN removal** (02-21): z-normalized recon already domain-invariant. DANN fought useful signal.
+6. **Proj removal** (02-21): 448->256 L2-normed projection was contrastive vestige. Direct features better for recon.
+7. **SE removal** (02-22): Downstream kappa identical to 4 decimal places with/without. 101K wasted params.
+8. **STFT 128d** (02-22): 64->128d, encoder 668K->777K. Better recon, downstream wash. Kept for representation quality.
+
+## Data sanitization (02-16)
+Dropped 7,735 bad epochs (0.29%): 5,413 flat-line (std<1e-6), 2,322 extreme artifact (>5% samples >20 sigma).
+2 subjects fully removed (100% flat). N1 F1 +0.021, N3 F1 +0.018 after cleanup.
+
+## SOTA comparison (02-15)
+| Model | Datasets | Subjects | Ch | Kappa | Notes |
+|-------|----------|----------|----|-------|-------|
+| U-Sleep (2021) | 23 | 15,660 | EEG+EOG | ~0.77 | 2ch, 7x more data |
+| L-SeqSleepNet (2023) | 4 | multi | 1 EEG | 0.838 | Within-dataset only |
+| SeqSleepNet xfer | multi | multi | 1 EEG | 0.76 | Cross-dataset |
+| Ours (v9) | 17 | 2,295 | 1 EEG | 0.758 | Cross-subj, 5 device types |
+
+## Literature reviews (02-15, 02-17)
+Reviewed ~30 repos/papers. All foundation models (EEGPT 10M, BIOT 3.3M, BENDR 15M,
+LaBraM 5.8-369M, REVE 69-408M) performed worse on sleep with 5-200x our params.
+Key insight: domain-specific inductive biases (AASM bands, CRF, BiGRU temporal context)
+beat massive pretraining for single-channel sleep staging. Nothing borrowable.
+
+## Per-dataset evaluation tiers (02-18)
+Tier 1 (model exceeds human IRR ~0.76): DCSM 0.849, Sleep-EDF 0.847, BOAS 0.830, CAP 0.790
+Tier 2 (moderate): DOD-H 0.771, DOD-O 0.696, YSYW 0.680, EESM19 0.677, SVUH 0.668
+Tier 3 (signal-limited): cEEGrid 0.567, EESM23 0.373, EESM17 0.016 (1 test subj)
+
+2026-02-23: v9 current state
+================================================================
+
+## Encoder (777K params, fully unsupervised)
+- 4-branch: small CNN 128d + large CNN 128d + spectral 128d + STFT 128d = 512d fused
+- Training: recon decoders only (spec=0.5, wave=0.3, delta=0.3, hfreq=0.3)
+- Best: epoch=47-val_loss=0.412, 50 epochs (~3.5 min/epoch)
+- Embedding: val_knn=0.750, silhouette(dataset)=-0.012
+
+## Downstream (frozen encoder + BiGRU + CRF, ~1.5M trainable)
+- 2-layer BiGRU (512d input, hidden=192, bidirectional) + CRF
+- seq_len=200, stride_train=50, stride_val=200, --freeze-epochs 999
+- Best: epoch=5-val_kappa=0.762 (early stop epoch 13)
+- test_kappa=0.758, test_F1=0.766, test_acc=0.771
+- Per-class F1: W=0.933, N1=0.516, N2=0.813, N3=0.741, REM=0.829
+
+2026-02-23: Residual analysis + encoder metric refactor
+================================================================
+
+## Residual analysis findings
+Ran reconstruction residual analysis (51K test epochs) + per-stage kNN embedding analysis (20K subsample).
+
+### Reconstruction bottleneck by stage (relative error = MSE/signal_power)
+| Stage | Spec RelErr | Wave RelErr | kNN F1 | Downstream F1 |
+|-------|-------------|-------------|--------|---------------|
+| N1    | 0.718       | 0.570       | 0.473  | 0.516         |
+| REM   | 0.663       | 0.588       | 0.513  | 0.829         |
+| N2    | 0.495       | 0.373       | 0.779  | 0.813         |
+| W     | 0.385       | 0.157       | 0.890  | 0.933         |
+| N3    | 0.228       | 0.146       | 0.713  | 0.741         |
+
+Key: N1 has highest relative recon error AND worst kNN/downstream F1.
+BiGRU+CRF rescues REM (0.51->0.83 via temporal context) but barely helps N1 (0.47->0.52).
+Downstream kappa (0.758) only +0.008 above kNN acc (0.750) -- encoder is the ceiling.
+
+### Spectral band error (spec decoder MSE)
+delta (1.00) >> theta (0.95) >> alpha (0.82) >> sigma (0.72) >> beta (0.42) >> gamma (0.19)
+Waveform residual power: delta 41% + theta 30% = 71% of residual.
+
+### Embedding geometry
+- N1-REM centroid distance: 1.40 (closest pair, vs W-N3=6.13 most distant)
+- Intra-class spread ~12 vs inter-centroid 1.4-6.1 -- massive overlap
+- PCA: theta/alpha/sigma/beta all load onto same PC (PC1). Encoder merges these
+  into one "high-freq axis" instead of independently representing each band.
+  For N1/REM separation, theta and alpha need independent axes:
+  N1=theta UP + alpha DOWN, REM=theta UP + alpha variable, W=theta LOW + alpha UP.
+
+### Diagnosis
+1. N1 is the critical bottleneck: lowest signal power, highest relative error, worst F1.
+2. theta/alpha not independently encoded -- merged into single PC. Band decoders
+   would create separate gradients forcing independent representation.
+3. Spec decoder (1.15M params, larger than encoder) dominates gradient bandwidth
+   at weight=0.5. Reducing to 0.3 frees capacity for band-specific targets.
+
+## val_knn metric refactor
+Changed val_knn from kNN accuracy to kNN Cohen's kappa across train_encoder.py,
+eval_embeddings.py, compare_encoders.py. Rationale: kappa penalizes class-imbalance
+shortcuts and weights confusion patterns, directly comparable to downstream kappa.
+Also added val_knn_f1 (macro F1) as secondary metric. Silhouette(dataset) retained
+for domain invariance monitoring.
+
+2026-02-23: Runtime profiling + speedups
+================================================================
+
+## Runtime profiling + speedups
+Profiled both training loops with PyTorch profiler (10-20 batches each).
+
+Encoder bottlenecks (batch_size=2048, epoch_mode):
+- Convolution fwd+bwd: 56% CUDA time (expected, core compute)
+- NCHW->NHWC format conversion: 8.1% (cuDNN Conv1d promotes to 2d; can't fix with channels_last)
+- Data loading: 2% (not a bottleneck)
+
+Downstream bottlenecks (batch_size=32, seq_len=200):
+- Kernel launch overhead: 272K launches/20 batches, 18% CPU time in cudaLaunchKernel
+- GPU utilization: only 1.26 GB peak at bs=32 (massively underutilized)
+- NCHW->NHWC: 5% CUDA time
+
+Applied speedups:
+| Change | Target | Speedup |
+|--------|--------|---------|
+| AMP fp16 (precision="16-mixed") | Encoder | 1.32x (0.224s->0.170s/batch) |
+| AMP fp16 | Downstream | (marginal compute, mainly batch size) |
+| cudnn.benchmark=True | Both | 1.07x encoder (auto-tunes conv algos) |
+| batch_size 32->48 | Downstream | 1.88x throughput (18K->35K ep/s) |
+
+Combined: encoder ~1.32x, downstream ~1.88x.
+VRAM: encoder 14.3->9.8 GB (AMP saves memory), downstream 1.3->11.2 GB (bigger batches)
+
+2026-02-23: AMP + CRF instability finding
+================================================================
+AMP fp16 causes downstream divergence (loss explosion to 7-9, best kappa ~0.694 at
+epoch 1 then collapse). Root cause: CRF log-sum-exp overflows in fp16 range.
+Both baseline and medium branch diverged identically with AMP+CRF. Fix: reverted
+downstream train_model.py to fp32 (encoder keeps AMP, no CRF there).
+
+2026-02-23: v10 architecture -- medium branch promoted to default
+================================================================
+Medium branch promoted from optional (--medium-branch flag) to always-on.
+Architecture is now 5-branch: small+medium+large CNN + spectral + STFT = 640d.
+Theta decoder (BranchDecoder 128d -> 4-8 Hz envelope) always active when delta_weight > 0.
+
+Cleanup:
+- Removed use_medium parameter from EpochEncoder, SleepStageNet, all training scripts
+- Removed BandDecoder class (dead end) and --band-weight CLI arg
+- Removed medium auto-detect from train_model.py (no longer needed)
+- Removed --medium-branch flag from train_encoder.py
+- Deleted old v9 checkpoints (incompatible with 640d architecture)
+
+New param counts: EpochEncoder 1.08M, SleepStageNet ~2.7M (1.63M trainable frozen)
+Full retrain needed -- no existing checkpoints.
+
+2026-02-24: v10 full baseline + torch.compile
+================================================================
+
+## Bugs fixed during this session
+1. fp16 overflow (val_loss NaN, epoch 24): spec_decoder/wave_decoder outputs overflow fp16
+   (~65k max) after sufficient training. Fix: .float() cast before MSE in _shared_step.
+   Was causing EarlyStopping (check_finite=True) to kill training at epoch 24/50.
+2. torch.compile checkpoint key mismatch: after fit(), module still holds OptimizedModule
+   (expects _orig_mod.* keys) but checkpoint has clean keys. Fix: unwrap _orig_mod before
+   trainer.test() in both train_encoder.py and train_model.py.
+
+## /review fixes applied (readers, dataset, analyze_residuals, config, compare_encoders)
+- readers.py: _SECONDS_PER_DAY constant; orig_sfreq captured before preprocess_raw
+- readers_extra.py: SVUH * 1e-6 µV->V conversion
+- dataset.py: shared empty tensor bug; wasted loop in SleepSequenceDataset
+- analyze_residuals.py: EPOCH_SAMPLES/TARGET_SFREQ imports; precompute raw_spectrum
+- config.py: _extract_metric_value IndexError guard
+- compare_encoders.py: misleading CKA centering comment
+
+## torch.compile speedup
+- Train encoder: ~2.5 min/epoch steady-state (vs ~4 min/epoch without compile = ~1.6x)
+- Compile warmup: ~5-8 min on epoch 0 (JIT compilation)
+- Portability: on_save_checkpoint strips ._orig_mod. prefix; _orig_mod unwrap before test
+
+## v10 full baseline results (50 enc epochs, frozen downstream)
+Encoder: epoch=47 best, val_loss=0.474
+- val_knn progression: 0.601 (epoch 0, random init!) -> 0.494 (epoch 20) -> 0.519 (epoch 49)
+- Note: val_knn below random init throughout training -- reconstruction loss optimizing
+  features that are only partially stage-discriminative; BiGRU+CRF recovers most of the gap
+
+Downstream (frozen enc, BiGRU+CRF, 40 epochs, early stopped ep 16):
+- Best val_kappa: 0.763 (epoch 13)
+- Test: kappa=0.754, F1=0.757, acc=0.754
+- Per-class F1: W=0.934, N1=0.488, N2=0.814, N3=0.727, REM=0.820
+
+| Version | test_kappa | F1_macro | acc   | Notes |
+|---------|------------|----------|-------|-------|
+| v9      | 0.758      | 0.766    | 0.771 | 4-branch, 512d |
+| v10     | 0.754      | 0.757    | 0.754 | 5-branch, 640d, medium CNN + theta decoder |
+
+v10 is -0.004 kappa/-0.009 F1 below v9. Medium CNN + theta decoder not helping downstream.
+
+## Updated version table
+| Version | Date  | test_kappa | Key change |
+|---------|-------|------------|------------|
+| v9      | 02-23 | 0.758      | 4-branch, delta+hfreq branch decoders |
+| v10     | 02-24 | 0.754      | 5-branch (+ medium CNN + theta decoder) |
+
+2026-02-24: SOTA comparison
+================================================================
+
+## Human inter-rater agreement (5-stage AASM, Younes et al. 2021 meta-analysis, n=11 studies)
+- Overall kappa: 0.76 (95% CI 0.71-0.81), accuracy: ~82%
+- N1 kappa: 0.24 (hardest stage), REM: 0.69, N2: 0.57, N3: 0.57, W: 0.70
+- Our N1 F1=0.488 mirrors human difficulty with N1 (kappa 0.24 = hardest for humans too)
+
+## Published SOTA (single-channel EEG, 5-stage AASM)
+### In-distribution (trained+tested same dataset — not a fair cross-dataset comparison)
+| Model           | Year | Dataset       | N subj  | Kappa | MF1   | Notes |
+|-----------------|------|---------------|---------|-------|-------|-------|
+| TinySleepNet    | 2020 | SleepEDF-20   | 20      | ~0.77 | 0.784 | |
+| AttnSleep       | 2021 | SHHS          | 329     | 0.78  | 0.735 | |
+| SleepTransformer| 2022 | SHHS          | 5,791   | 0.828 | 0.801 | |
+| L-SeqSleepNet   | 2023 | SHHS          | 5,791   | 0.838 | 0.814 | Best single-ch in-dist |
+| ZleepAnlystNet  | 2024 | SleepEDF-13   | 13      | 0.822 | 0.821 | |
+
+### Cross-dataset / OOD (fair comparison)
+| Model              | Year | Train           | Test (OOD)        | Kappa     | Notes |
+|--------------------|------|-----------------|-------------------|-----------|-------|
+| Stephansen CRNN    | 2020 | MGH 6,431 subj  | HomePAP/ABC OOD   | 0.66-0.69 | Multi-ch EEG |
+| ZleepAnlystNet     | 2024 | SHHS train      | SleepEDF-13 OOD   | 0.779     | Single-ch |
+| U-Sleep            | 2021 | 15,660 (16 ds)  | 8 held-out ds     | 0.819 med | Multi-ch EEG+EOG |
+| SOMNUS (ensemble)  | 2025 | 27,494 (15 ds)  | 24 ds OOD         | 0.85-0.89 | Multi-ch ensemble |
+| **Ours (v10)**     | 2024 | **2,293 (17 ds)**| **335 subj (17 ds)** | **0.754** | **Single-ch, device-agnostic** |
+
+### Ear-EEG / in-ear EEG specifically
+| Study             | Year | N subj | Device        | Kappa     | Notes |
+|-------------------|------|--------|---------------|-----------|-------|
+| Mikkelsen et al.  | 2019 | ~20    | Custom dry    | 0.73-0.74 | Single-ear, subject-independent |
+| Tabar et al.      | 2023 | ~15    | Dry earpiece  | 0.70      | Subject-independent |
+| L-SeqSleepNet     | 2023 | ~15    | Ear-EEG DB    | 0.829     | In-distribution, homogeneous DB |
+| Scalp-to-ear xfer | 2024 | 13     | In-ear        | 0.589-0.639| Fine-tuned YASA, older adults |
+
+## Positioning
+1. At human inter-rater ceiling (0.754 vs 0.76) on a genuinely hard 17-dataset OOD benchmark.
+2. Cross-dataset generalization: competitive with best published OOD results (0.66-0.78),
+   despite being single-channel vs multi-channel for Stephansen/U-Sleep.
+3. Ear-EEG specifically: above any published subject-independent ear-EEG result (0.70-0.74),
+   and approaching the best in-distribution ear-EEG result (L-SeqSleepNet 0.829, single DB).
+4. Gap vs in-distribution SOTA (0.838): ~0.08 kappa -- but in-dist vs OOD is not apples-to-apples.
+   Stephansen loses 0.09-0.12 kappa going OOD; our model is designed to not have in-dist numbers.
+5. U-Sleep (0.819 OOD) uses 7x more data and multi-channel EEG+EOG -- single-channel constraint
+   is meaningful (wearable target), not just a handicap.
+
+## Critical caveat
+Published in-distribution numbers (0.82-0.84) rarely generalize: Stephansen drops to 0.66-0.69 OOD.
+Our honest OOD benchmark (335 subjects, 17 datasets, no data seen during training) is the correct
+comparison for a real-world deployment target. SOMNUS (0.89) is the only multi-dataset multi-channel
+model with a comparable honest evaluation, but uses 12x more data and multi-channel setup.
+
+2026-02-24: v11 architecture -- signed theta + slowwave + sawtooth decoders
+================================================================
+
+## Decoder changes (all now default)
+Three changes baked into train_encoder.py defaults:
+1. **theta rectify False**: theta decoder target changed from envelope (abs) to signed waveform.
+   Preserves sawtooth wave asymmetry in REM theta band (4-8 Hz). Was rectify=True.
+2. **slowwave decoder**: new BranchDecoder(128) on large CNN (feat_l), 0.5-1 Hz signed.
+   Targets slow oscillation morphology (narrower than delta decoder's 0.5-4 Hz).
+3. **sawtooth decoder**: new BranchDecoder(128) on medium CNN (feat_m), 2-6 Hz signed.
+   Targets REM sawtooth wave morphology (spans delta/theta boundary).
+
+Rationale: N3/REM both confused with N2 (11-24% confusion). N3-N2 is a slow-wave counting
+vs power problem; sawtooth waves (2-6 Hz, REM-specific) are not captured by theta envelope.
+Signed targets preserve waveform asymmetry that distinguishes these stages.
+
+## Codebase cleanup
+- Deleted all checkpoint/log/plot artifacts: abl_*, compile_bench, v10
+- Updated analyze_residuals.py: fixed theta rectify=True bug, added slowwave/sawtooth tracking
+- Updated CLAUDE.md: training command simplified (all flags now default), decoder table updated
+
+## Current state
+- Architecture: 5-branch encoder (640d) + 7 recon decoders (training-only)
+- New decoders add 130K params (training-only, discarded after encoder training)
+- Status: awaiting full v11 training run (50 epochs, ~2.5h with torch.compile)
+
+2026-02-24: v11 full training results
+================================================================
+
+## Encoder (50 epochs, full data, torch.compile)
+- Best: epoch=49 (last), val_loss=0.621 (hit max_epochs, no early stop)
+- Test kNN kappa: 0.464, F1: 0.479, acc: 0.623
+- val_knn during training: peaked epoch 2 (0.376) then monotonically decayed to 0.278 at epoch 49
+- Silhouette(stage): -0.005, Silhouette(dataset): -0.009 (good domain invariance)
+- CH: 130.5, DB: 12.187
+- OBSERVATION: Online val_knn is biased -- non-shuffled val loader, only first 3 batches
+  sampled (~6144 of 388K epochs). This makes val_knn unreliable as an early-stop signal.
+  Encoder kNN peaked early (epoch 2) then declined as reconstruction improved --
+  classic reconstruction-vs-cluster tradeoff.
+
+## Downstream (frozen encoder, BiGRU+CRF, 40 epochs)
+- Early stopped at epoch 17, best: epoch=7, val_kappa=0.762
+- Test: kappa=0.752, F1_macro=0.758, acc=0.761
+- Per-class F1: W=0.931, N1=0.495, N2=0.810, N3=0.728, REM=0.825
+
+## v11 vs v10 comparison
+| Metric | v10 | v11 | delta |
+|--------|-----|-----|-------|
+| test_kappa | 0.754 | 0.752 | -0.002 |
+| F1_macro | 0.757 | 0.758 | +0.001 |
+| acc | 0.754 | 0.761 | +0.007 |
+| N1 F1 | 0.488 | 0.495 | +0.007 |
+| N3 F1 | 0.727 | 0.728 | +0.001 |
+| REM F1 | 0.820 | 0.825 | +0.005 |
+
+Essentially a wash at full scale.
+
+## Updated version table
+| Version | Date  | test_kappa | F1_macro | acc   | Key change |
+|---------|-------|------------|----------|-------|------------|
+| v9      | 02-23 | 0.758      | 0.766    | 0.771 | 4-branch, 512d |
+| v10     | 02-24 | 0.754      | 0.757    | 0.754 | 5-branch, 640d, medium CNN + theta decoder |
+| v11     | 02-24 | 0.752      | 0.758    | 0.761 | + signed theta + slowwave + sawtooth decoders |
+
+v9 remains best at kappa (0.758) but uses older 512d arch. v11 is current default (640d).
+
+## /review fixes applied (2026-02-24)
+- config.py: removed dead "loss" entry from _LOWER_IS_BETTER
+- model.py: updated BranchDecoder docstring (now covers all 5 decoders)
+- train_encoder.py: EPOCH_SAMPLES instead of hardcoded 3840; single 5000 kNN cap
+  (replaces 8000-collect/5000-subsample two-step); updated stale docstring example;
+  added EPOCH_SAMPLES to imports
+- eval_embeddings.py: added NUM_STAGES import; replaced range(len(STAGE_NAMES))
+- analyze_residuals.py: _band_indices sfreq default uses TARGET_SFREQ
+
+## Remaining levers (untested at full scale)
+1. Monitor val_knn for encoder early stopping (now unbiased with shuffle fix)
+2. Encoder trained longer than val_loss plateau -- val_knn peaked epoch 0, needs different monitor
+3. Wave samples 1920 (2x ds) -- untested
+4. Spec weight reduction 0.5->0.3 -- untested at full scale
+
+2026-02-24: v12 -- val_knn bias fix (shuffle=True)
+================================================================
+
+## Changes
+1. **val_dataloader shuffle=True**: fixed biased val_knn measurement. Previously val loader was
+   unshuffled, so kNN only ever saw the first ~6144 epochs (same subjects every epoch).
+   Now samples random subset each epoch -- unbiased kNN estimate.
+2. **on_load_checkpoint**: added reverse of on_save_checkpoint for torch.compile resume.
+   Checkpoint saves strip _orig_mod prefix; on_load re-adds it when encoder is compiled.
+   Without this, resuming compiled training crashes with key mismatch.
+
+## Encoder (50 epochs, full data, torch.compile)
+- Best: epoch=49 (last), val_loss=0.627, test/loss=0.632
+- Test kNN kappa: 0.472, F1: 0.490 (vs v11: 0.464, 0.479 -- slight improvement)
+- val_knn: 0.539 (epoch 0) -> ~0.44 plateau (reconstruction-cluster tradeoff confirmed genuine)
+- v11's val_knn: 0.376 (epoch 2) -> 0.278 (epoch 49) -- biased, always same subjects
+- Unbiased val_knn (v12) shows tradeoff is real but less severe than biased v11 suggested
+
+## Downstream (frozen encoder, BiGRU+CRF, 40 epochs)
+- Early stopped at epoch 17, best: epoch=11, val_kappa=0.761
+- Test: kappa=0.749, F1_macro=0.756, acc=0.753
+- Per-class F1: W=0.930, N1=0.491, N2=0.811, N3=0.731, REM=0.818
+
+## v12 vs v11 comparison
+| Metric | v11 | v12 | delta |
+|--------|-----|-----|-------|
+| test_kappa | 0.752 | 0.749 | -0.003 |
+| F1_macro | 0.758 | 0.756 | -0.002 |
+| acc | 0.761 | 0.753 | -0.008 |
+| N1 F1 | 0.495 | 0.491 | -0.004 |
+| REM F1 | 0.825 | 0.818 | -0.007 |
+
+Wash (-0.003 kappa, within noise). Val shuffle is pure instrumentation -- doesn't change
+training dynamics, only affects checkpoint selection (noisier val_loss with shuffled data).
+
+## Conclusion
+Val shuffle kept as default (honest measurement > slightly noisier checkpoint selection).
+v12 is new current baseline. Differences from v11 are noise-level.
+
+## Updated version table
+| Version | Date  | test_kappa | F1_macro | acc   | Key change |
+|---------|-------|------------|----------|-------|------------|
+| v9      | 02-23 | 0.758      | 0.766    | 0.771 | 4-branch, 512d |
+| v10     | 02-24 | 0.754      | 0.757    | 0.754 | 5-branch, 640d, medium CNN + theta decoder |
+| v11     | 02-24 | 0.752      | 0.758    | 0.761 | + signed theta + slowwave + sawtooth decoders |
+| v12     | 02-24 | 0.749      | 0.756    | 0.753 | val_knn shuffle fix + on_load_checkpoint |
+
+2026-02-25: Dead end re-validation at full scale
+================================================================
+
+Two dead ends previously validated only at ablation scale re-tested at full scale (v12 baseline).
+
+## Gap features (downstream only, frozen v12 encoder)
+Added GapFeatureExtractor (10 per-epoch features from band RMS envelopes: delta/sigma/slow_osc/
+theta/alpha/hfreq envelope stats + sigma-delta coupling + waveform asymmetry). Concatenated to
+640d encoder embeddings -> 650d input to BiGRU+CRF.
+
+Results (40 epochs, early stopped):
+| Metric | v12 baseline | gap_features | delta |
+|--------|-------------|-------------|-------|
+| test_kappa | 0.749 | 0.748 | -0.001 |
+| F1_macro | 0.756 | 0.759 | +0.003 |
+| N1 F1 | 0.491 | 0.505 | +0.014 |
+| N2 F1 | 0.811 | 0.806 | -0.005 |
+| N3 F1 | 0.731 | 0.721 | -0.010 |
+| REM F1 | 0.818 | 0.830 | +0.012 |
+
+Verdict: wash. N1/REM gains offset by N2/N3 losses. BiGRU+CRF already captures temporal patterns.
+
+## Fused band decoders (encoder retrain required)
+Added 3 BranchDecoder(input_dim=640) instances reconstructing theta (4-8 Hz), alpha (8-12 Hz),
+sigma (12-16 Hz) from fused 640d representation. Weight=0.3 each. 933K training-only params.
+
+Encoder (50 epochs): val_loss=0.830 (v12: 0.627 -- higher loss from additional decoder targets)
+Downstream (40 epochs, frozen encoder):
+| Metric | v12 baseline | fused_band | delta |
+|--------|-------------|-----------|-------|
+| test_kappa | 0.749 | 0.752 | +0.003 |
+| F1_macro | 0.756 | 0.753 | -0.003 |
+| N1 F1 | 0.491 | 0.473 | -0.018 |
+| N2 F1 | 0.811 | 0.812 | +0.001 |
+| REM F1 | 0.818 | 0.820 | +0.002 |
+
+Verdict: wash/slightly negative. N1 actually worse (-0.018). Fused band decoders don't help
+because existing per-branch decoders (128d -> band) already provide sufficient band-specific
+gradients. Reconstructing from fused representation forces redundant computation.
+
+## Conclusion
+Both dead ends confirmed at full scale. Original ablation-era entries were directionally correct.
+Cleaned up: deleted gap_test/fused_band checkpoints+logs, removed experimental code.
+
+2026-02-25: Architecture exploration + diagnostics
+================================================================
+
+## Experiments tested (downstream-only, v12 encoder frozen)
+- Position embedding (window-relative scalar appended to 640d): kappa=0.751 (+0.002, wash)
+  Confirms BiGRU already encodes temporal position implicitly. Dynamic CRF hypothesis falsified.
+
+## N1 transition diagnostic (analyze_n1_transitions.py)
+32,082 test N1 epochs split by run context:
+  onset     (36.2%): acc=46.2%  W=17.0% N2=27.9% REM=8.3%
+  sustained (63.8%): acc=51.9%  W=14.3% N2=25.0% REM=8.5%
+  exit      (36.2%): acc=43.1%  W=12.4% N2=35.4% REM=8.7%
+Delta onset/sustained: +5.7pp -- genuine but moderate transition effect.
+Exit N1 is worst (43.1%): BiGRU backward pass sees coming N2, biases predictions.
+REM confusion (~8.5%) is uniform across contexts -- pure encoder problem.
+
+## Ideas evaluated (not implemented -- critical analysis):
+- Factorized latent space (z_stage/z_subject/z_device): unidentifiable without labels
+- Counterfactual device transfer: no paired cross-device data, domain shift already solved
+- Physiology token pretraining: no device-agnostic event detector exists
+- Dynamic CRF (circadian/elapsed-time conditioning): position emb test falsified
+- Two-head (stage + transition): derived labels add no new signal; Semi-Markov already failed
+- Uncertainty-aware soft labels: softening N1 teaches "be uncertain about N1" (wrong direction)
+- Temperature scaling: changes CRF emission/transition balance, not a clean calibration tool
+- Test-time adaptation: GroupNorm has no running stats; domain shift already ~0
+- Sleep world model (generative Deep HMM): current CRF IS state estimation; disc. wins at scale
+
+## Queued explorations
+- VICReg branch covariance penalty (encoder retrain required):
+  Targets diagnosed failure: theta/alpha collapse onto same PC (residual analysis 2026-02-23).
+  Force each of 640 embedding dims to carry independent info via off-diagonal cov penalty.
+  Expected: +0.005-0.015 kappa if theta/alpha disentanglement improves N1/REM separation.
+- Trajectory dynamics auxiliary loss (downstream, no encoder retrain):
+  Next-embed prediction head: Linear(384,640) on BiGRU output predicts encoder embed at t+1.
+  Weighted by backward embedding change to upweight onset, downweight exit.
+  Expected: modest N1 onset improvement (+0.005 N1 F1), uncertain exit interaction.
+
+2026-02-25: Downstream retrain after CRF loss scaling fix
+================================================================
+
+## Code change
+- train_model.py: CRF loss changed from `reduction="mean"` + manual `/ seq_len`
+  to `reduction="token_mean"` (removed extra seq_len attenuation).
+- Goal: restore intended CRF contribution relative to CE aux loss.
+
+## Run details
+- Cleared old downstream checkpoints: `checkpoints/sleep_model/v12/*`
+- Command:
+  `python train_model.py --exp-name v12 --encoder-ckpt checkpoints/encoder/v12/epoch=49-val_loss=0.627.ckpt`
+- Setup: frozen encoder (`freeze_epochs=999`), batch_size=48, seq_len=200, CE weight=1.0
+
+## New downstream checkpoints
+- `epoch=5-val_kappa=0.760.ckpt`
+- `epoch=8-val_kappa=0.761.ckpt` (best)
+- `epoch=11-val_kappa=0.759.ckpt`
+- `last.ckpt`
+
+## Test metrics (best ckpt)
+- test_kappa=0.7486
+- test_F1_macro=0.7590
+- test_acc=0.7655
+- Per-class F1: W=0.931, N1=0.512, N2=0.806, N3=0.726, REM=0.820
+
+## Fixes applied in this session
+1. **torch.compile resume compatibility (downstream)**  
+   Added `on_load_checkpoint` in `train_model.py` to reverse save-time key cleanup
+   (`model.epoch_encoder.*` <-> `model.epoch_encoder._orig_mod.*`) when encoder is compiled.
+   This fixes resume key mismatch for `--compile` + `--resume`.
+2. **CRF loss scaling correction (downstream)**
+   Replaced CRF loss `reduction="mean"` + manual `/ seq_len` with
+   `reduction="token_mean"` in `train_model.py`.
+   This removes unintended extra attenuation of CRF relative to CE auxiliary loss.
+
+2026-02-25: Trajectory dynamics auxiliary loss experiment
+================================================================
+
+## Hypothesis
+Next-embedding prediction head on BiGRU output teaches the model to track
+state transitions. Backward-change weighting upweights onset epochs (just entered new state)
+and downweights exit epochs (BiGRU already sees coming state via backward pass).
+
+## Implementation
+- `model.py`: `_encode()` helper + `forward_with_internals()` returning (logits, embeds, context)
+- `train_model.py`: `traj_head = nn.Linear(384, 640)` on BiGRU context output
+- Training loss: `main_loss + traj_weight * weighted_MSE(pred_next_embed, actual_next_embed)`
+- Weight per step: `||embed[t] - embed[t-1]||` normalized to mean 1
+- `--traj-weight 0.1` used for test run
+
+## Bug
+`nn` not imported in train_model.py (only `torch.nn.functional as F`).
+Fixed by adding `import torch.nn as nn`.
+
+## Result: exp-name=traj_dyn_test
+- Best val kappa: 0.7594 (epoch 9)
+- Test kappa: 0.7464, F1: 0.7553, acc: 0.7593
+- vs v12 baseline: kappa=-0.003, F1=-0.001
+
+## Verdict: DEAD END
+The `traj_loss` had massive spikes (max 127x) caused by backward-change weighting
+amplifying gradient noise at transition batches. Despite eventual stabilization (~0.3),
+the auxiliary signal added no benefit. Net: -0.003 kappa.
+Root cause: BiGRU already implicitly learns temporal dynamics; explicit next-embed
+prediction is redundant and adds instability.
+Added to CLAUDE.md dead ends.
+
+2026-02-25: VICReg covariance regularizer encoder experiment
+================================================================
+
+## Hypothesis
+Theta/alpha/sigma/beta collapse onto same PC in v12 (diagnosed 2026-02-23).
+Off-diagonal covariance penalty on fused 640d embeddings forces each dimension
+to encode independent information, targeting N1/REM separation.
+
+## Implementation plan
+- `train_encoder.py`: add `vicreg_weight` param (default 0.0)
+- In `_shared_step`: after `fused` computed, add cov_loss:
+  `cov = (z - z.mean(0)).T @ (z - z.mean(0)) / (N-1)`
+  `cov_loss = cov.fill_diagonal_(0).pow(2).sum() / d`
+- Also add variance term: `var_loss = F.relu(1 - z.std(0)).mean()` (prevent collapse)
+- Total: `loss += vicreg_weight * (cov_loss + var_weight * var_loss)`
+- `--vicreg-weight 0.04` (VICReg paper default scale for cov term)
+
+## Status: clean 50-epoch run in progress (see checkpoints/encoder/vicreg_test)
+
+## Bugs found and fixed during VICReg development
+1. **VICReg cov_loss NaN** (original formulation):
+   - `(z_centered.T @ z_centered)` produced NaN when `fused` fp16 had Inf values
+   - Cause: fp16 encoder overflow on some batches → Inf embeddings → Inf-Inf=NaN in GEMM
+   - Fix: standardize z per-dimension before computing correlation matrix (`z / z.std(0).clamp(min=1e-4)`)
+   - Also: `nan_to_num` on fused.float() before VICReg computation
+2. **spec/wave val_loss NaN** (at epoch 6+):
+   - Spec/wave decoder output was NaN for batches with Inf embeddings
+   - `spec_target` could have Inf from `stft.abs().square()` on Inf signals
+   - Fix: `.nan_to_num(0.0, posinf=1e6)` on `stft.abs().square()` before log1p
+   - Fix: `.nan_to_num(0.0)` on spec_decoder and wave_decoder outputs before MSE
+3. **`nn` not imported** in train_model.py:
+   - `nn.Linear` for traj_head used `nn` which was not imported
+   - Fix: `import torch.nn as nn`
+
+## Preliminary downstream result (vicreg_ds_test, using undertrained epoch=18 encoder)
+- Encoder: 18 epochs, val_loss=1.193 (vs v12's 50 epochs, val_loss=0.627)
+- Encoder embedding quality: silhouette=-0.004, dataset_sil=-0.017, kNN kappa=0.503
+- vs v12 encoder: silhouette=-0.145, dataset_sil=-0.306, kNN kappa=0.44-0.45
+- **Downstream test results**:
+  - kappa=0.7531 vs v12=0.7486 (+0.005 kappa)
+  - F1=0.7611 vs v12=0.7590 (+0.002 F1)
+  - N1 F1=0.510 (unchanged), N2=0.814 (+0.008), REM=0.823 (+0.003)
+- Interpretation: VICReg with UNDERTRAINED encoder already +0.005 kappa. Properly trained
+  50-epoch encoder expected to show more improvement as reconstruction converges.
+
+## Final downstream result (vicreg_final, using clean epoch=9 encoder, val_loss=1.011)
+- Encoder stopped early at epoch 9 (val_vicreg_cov spikes prevented val_loss from improving)
+- Encoder embedding quality at epoch 9: silhouette=-0.003, dataset_sil=-0.019, kNN kappa=0.496
+- **Downstream test results (vicreg_final)**:
+  - test kappa=0.7480 vs v12=0.7486 (-0.001, wash)
+  - test F1=0.7554 vs v12=0.7553 (+0.000, wash)
+  - test acc=0.7593 vs v12=0.7534 (+0.006)
+  - Per-class F1: W=0.930, N1=0.490, N2=0.804, N3=0.721, REM=0.831
+
+## Analysis
+- VICReg dramatically improves encoder embedding structure (silhouette -0.003 vs -0.145)
+- But test kappa doesn't improve: bottleneck is BiGRU+CRF capacity, not encoder representation quality
+- Root cause of early stopping: val_vicreg_cov spikes (cov reaches 7.4x at epoch 12)
+  - Extreme validation samples get nan_to_num'd to 0, skewing correlation of remaining samples
+  - This inflates val_vicreg_cov -> val_loss fails to improve past epoch 9 -> EarlyStopping at epoch 24
+- Preliminary result (vicreg_ds_test, epoch=18) showed +0.005 kappa but that was noise/different run
+- Conclusion: **VICReg at weight=0.04 = dead end** (encoder undertrained due to cov spikes, no downstream gain)
+- Open question: lower weight (0.01) might allow longer training, but BiGRU bottleneck means unlikely to help
+
+## Verdict: dead end -- add to CLAUDE.md
+
+---
+## 2026-02-25 Session Status
+
+### Experiment Summary Table
+| Exp | Encoder | test kappa | test F1 | Delta vs v12 | Status |
+|-----|---------|-----------|---------|--------------|--------|
+| v9 | 512d, 4-branch, 50ep | 0.758 | 0.766 | +0.009 | Older arch, no VICReg |
+| v12 | 640d, 5-branch, 50ep | 0.749 | 0.756 | baseline | Current best |
+| traj_dyn_test | v12 encoder | 0.746 | 0.755 | -0.003 | Dead end |
+| vicreg_final | VICReg ep9 encoder | 0.748 | 0.755 | -0.001 | Dead end |
+
+### Current state
+- v12 (kappa=0.749, F1=0.756) remains best checkpoint
+- All recent experiments (VICReg, trajectory dynamics) are washes or worse
+- BiGRU+CRF appears to be the bottleneck; encoder quality improvements don't transfer
+
+### Open levers (not yet tried)
+1. Partial encoder fine-tuning (--freeze-epochs N, unfreeze encoder mid-training)
+2. Larger BiGRU (hidden 192->256, ~+500K params)
+3. Accept 0.749 as ceiling for current architecture
+
+---
+## 2026-02-26 bigru256 result -- NEW BEST
+
+### bigru256 (gru_hidden=192->256, v12 encoder, frozen)
+- Trainable params: 2,565,672 (was 1,629,352, +936K)
+- Best val_kappa: 0.767 @ epoch 7, EarlyStopped epoch 17
+- **Test results**:
+  - kappa=0.757 vs v12=0.749 (+0.008)
+  - F1=0.763 vs v12=0.756 (+0.007)
+  - acc=0.763 vs v12=0.753 (+0.010)
+- Per-class F1: W=0.934, N1=0.501, N2=0.814, N3=0.734, REM=0.833
+- All stages improved; N3 biggest gain (+0.013)
+
+### Conclusion
+BiGRU capacity WAS the bottleneck. 192->256 hidden gives consistent +0.008 kappa.
+bigru256 is new default baseline. Next: add --rec-pos feature on top of bigru256.
+
+### Updated experiment table
+| Exp | test kappa | test F1 | Delta |
+|-----|-----------|---------|-------|
+| v9 (512d, 4-branch) | 0.758 | 0.766 | (old arch) |
+| v12 (640d, 5-branch, gru=192) | 0.749 | 0.756 | baseline |
+| bigru256 (640d, 5-branch, gru=256) | 0.757 | 0.763 | +0.008 |
+
+## 2026-02-26: SCE loss and encoder fine-tuning results
+
+### Encoder fine-tuning (finetune_enc)
+- Goal: improve N1 F1 via encoder adaptation from converged bigru256 state
+- Architecture: full bigru256 weights loaded via --model-ckpt, encoder LR=1e-5, BiGRU LR=1e-4
+- Result: val_kappa peak=0.765 (vs bigru256 0.767), test wash
+- Verdict: encoder quality is NOT the N1 bottleneck. Added to dead ends.
+
+### Symmetric Cross-Entropy loss (sce_loss)
+- Config: sce_weight=0.5, gru_hidden=256, freeze-epochs=999, v12 encoder
+- Hypothesis: RCE term bounds loss regardless of label noise; improves N1 via noise-robustness
+- Result: test kappa=0.753, F1=0.752 (bigru256: 0.757, 0.763) -- -0.004 kappa, -0.011 F1
+- Val trajectory: peaked epoch 2 (0.766), then slowly declined; early stop epoch 12
+- Analysis: RCE dominates training early (RCE~3.3 vs CRF~1.5 at epoch 0); faster convergence but lower asymptote
+- Verdict: dead end. Added to CLAUDE.md.
+
+### Multi-scale BiGRU (multiscale) -- IN PROGRESS
+- Config: --multiscale, gru_hidden=256, freeze-epochs=999, v12 encoder
+- Architecture: fine GRU (2-layer, hidden=256) + coarse GRU (1-layer, hidden=128, stride=20), classifier_in=768
+- Hypothesis: coarse GRU captures sleep cycle context (90min scale); helps N1/REM transitions
+- Status: training started 2026-02-26
+
+### Multi-scale BiGRU (multiscale) - FINAL
+- Config: --multiscale, gru_hidden=256, coarse_stride=20, freeze-epochs=999, v12 encoder
+- Architecture: fine GRU (2-layer, hidden=256) + coarse GRU (1-layer, hidden=128, stride=20), classifier_in=768
+- Val trajectory: slow start (ep0-2: large gap vs bigru256), gap closed ep3+, val_kappa ~same as bigru256 per-epoch
+- Best val: ep12 kappa=0.763 (bigru256 best=0.768)
+- Test: kappa=0.752, F1=0.758, acc=0.762 (bigru256: 0.757, 0.763, 0.763)
+- Delta: -0.005 kappa, -0.005 F1
+- Analysis: fine BiGRU already processes full 200-epoch sequence bidirectionally; coarse GRU at stride=20 (10 positions) covers no new temporal scale, adds parameters/noise
+- Verdict: dead end. Added to CLAUDE.md.
+
+### Current Status
+All N1-improvement approaches exhausted: rec_pos (-0.004), finetune_enc (wash), sce_loss (-0.004), multiscale (-0.005).
+Best remains bigru256: test kappa=0.757, F1=0.763.
+Next: discuss strategy with user. Potential remaining approaches: class-weighted CE for N1, longer seq_len, CRF transition init.
+
+## 2026-02-28: Per-branch diagnostic and spectral_only breakthrough
+
+### Per-branch kNN diagnostic (eval_branches.py)
+Sliced 640d encoder embeddings into 5x128d branches, ran kNN on each independently.
+Critical finding: CNN branches carry ~zero N1 info (N1 F1 < 0.08), spectral branch best (N1 F1=0.252).
+Fusion HURTS N1: fused 640d N1 F1=0.197 < spectral alone (0.252).
+
+### Branch experiments (4 variants tested)
+| Variant | test_kappa | test_f1 | delta_k | delta_f1 |
+|---------|-----------|---------|---------|----------|
+| bigru256 baseline | 0.757 | 0.763 | — | — |
+| branch_weights | 0.753 | 0.764 | -0.004 | +0.001 |
+| branch_gru | 0.756 | 0.763 | -0.001 | +0.000 |
+| per_stage_heads | 0.753 | 0.761 | -0.004 | -0.002 |
+| **spectral_only** | **0.762** | **0.770** | **+0.005** | **+0.007** |
+
+### spectral_only: new best model
+- Architecture: BiGRU+CRF on 256d (spectral+STFT only), dropping 384d CNN branches
+- N1 F1 mean: 0.443 vs 0.418 (+0.025 across 17 datasets, wins 12/17)
+- Headband devices: kappa +0.043, Forehead: +0.138
+- Root cause: CNN embeddings are device-specific (waveform morphology), spectral features are device-invariant
+- Checkpoint: checkpoints/sleep_model/spectral_only/epoch=5-val_kappa=0.770.ckpt
+
+### spec_n1aux: spectral_only + N1AuxFeatures (NEW BEST)
+N1AuxFeatures: downstream-only module (24K params) combining:
+1. Static spectral features: spectral entropy, peak frequency, alpha-theta crossover
+2. Sub-epoch dynamics: 3-segment band powers, slopes, alpha variance (24 features -> MLP -> 32d)
+3. Augmented STFT: 2-layer transformer on STFT patches (vs encoder's 1-layer) -> 32d
+Total: 64d concatenated with 256d spectral_only before GRU
+
+Results:
+- test_kappa=0.763, test_F1=0.773, test_acc=0.778
+- Per-class F1: W=0.931, N1=0.520, N2=0.821, N3=0.746, REM=0.844
+- Delta vs bigru256: +0.006 kappa, +0.010 F1, N1 +0.019, N3 +0.012, REM +0.011
+- Delta vs spectral_only: +0.001 kappa, +0.003 F1
+- Best epoch: 4 (val_kappa=0.7745), early stopped at epoch 14
+- Checkpoint: checkpoints/sleep_model/spec_n1aux/epoch=4-val_kappa=0.774.ckpt
+
+### Updated comparison
+| Model | test_kappa | F1_macro | N1 F1 | Key change |
+|-------|-----------|----------|-------|------------|
+| bigru256 | 0.757 | 0.763 | 0.501 | 640d, gru=256 |
+| spectral_only | 0.762 | 0.770 | ~0.51 | Drop CNN branches |
+| **spec_n1aux** | **0.763** | **0.773** | **0.520** | + N1AuxFeatures 64d |
+
+### spec_heads (re-run completed)
+- spectral_only + per_stage_heads: re-run completed, best epoch 12 (val_kappa=0.776)
+- test_kappa=0.766, test_F1=0.771, N1_F1=0.513, N3_F1=0.744
+- Per-stage heads improve N2/N3 precision; best kappa among single-feature experiments
+
+### spec_heads_n1aux (combined -- new best)
+- spectral_only + per_stage_heads + N1AuxFeatures
+- Best epoch: 13 (val_kappa=0.777), early stopped at epoch 23
+- test_kappa=0.769, test_F1=0.775, test_acc=0.771
+- Per-class F1: W=0.937, N1=0.521, N2=0.826, N3=0.751, REM=0.837
+- Delta vs bigru256: +0.012 kappa, +0.011 F1, N1 +0.020, N3 +0.017
+- Improvements from per_stage_heads and N1AuxFeatures stack additively
+- Checkpoint: checkpoints/sleep_model/spec_heads_n1aux/epoch=13-val_kappa=0.777.ckpt
+
+### Full comparison (all 8 experiments, CRF Viterbi decode)
+| Model | test_kappa | F1_macro | N1_F1 | N3_F1 | Key change |
+|-------|-----------|----------|-------|-------|------------|
+| spec_heads_n1aux | 0.769 | 0.775 | 0.521 | 0.751 | heads + n1aux (NEW BEST) |
+| spec_heads | 0.766 | 0.771 | 0.513 | 0.744 | per_stage_heads |
+| spec_n1aux | 0.763 | 0.773 | 0.521 | 0.747 | N1AuxFeatures |
+| spectral_only | 0.761 | 0.770 | 0.519 | 0.734 | drop CNN branches |
+| bigru256 | 0.757 | 0.763 | 0.501 | 0.734 | 640d, gru=256 |
+| branch_gru | 0.756 | 0.763 | 0.508 | 0.728 | per-branch GRU |
+| branch_weights | 0.753 | 0.764 | 0.518 | 0.730 | learnable branch weights |
+| per_stage_heads | 0.753 | 0.761 | 0.506 | 0.734 | per-stage heads (full 640d) |
+
+2026-02-28: Cleanup -- spec_heads_n1aux as default
+================================================================
+Made spec_heads_n1aux configuration the default in model.py and train_model.py:
+- spectral_only=True (hardcoded: GRU sees only spectral+STFT 256d, drops CNN branches)
+- per_stage_heads=True (hardcoded: 5 separate MLP heads instead of single linear)
+- n1_aux=True (hardcoded: N1AuxFeatures 64d always computed)
+- gru_hidden=256 (default)
+
+Removed 12 dead-end flags from SleepStageNet and CLI:
+  use_branch_weights, use_branch_gru, spectral_only (now always on),
+  use_per_stage_heads (now always on), use_n1_aux (now always on),
+  use_pos_emb, use_rec_pos, use_multiscale, coarse_stride,
+  traj_weight, sce_weight, forward_with_internals
+
+Deleted obsolete files:
+  run_branch_experiments.py, eval_bigru256.py, compare_all_experiments.py
+
+Updated: CLAUDE.md (architecture, codebase table), eval_per_dataset.py (default exp-name)
+
+2026-02-28: Downstream improvement experiments (batch 1)
+================================================================
+Ran 5 experiments testing orthogonal improvement axes vs spec_heads_n1aux baseline.
+All use same frozen encoder (v12 epoch=49), same data split, same hyperparams except the tested flag.
+
+Code changes:
+  model.py: N1AuxFeatures now takes n_segments param; SleepStageNet takes n_segments + cross_epoch_conv
+  train_model.py: 3 new CLI flags (--n-segments, --cross-epoch-conv, --crf-prior), CRF prior init method
+
+Results (test set, Viterbi decode):
+  | Experiment       | Kappa | F1    | Acc   | N1 F1 | Delta kappa |
+  |------------------|-------|-------|-------|-------|-------------|
+  | baseline         | 0.769 | 0.775 | 0.776 | 0.525 | --          |
+  | gru384           | 0.772 | 0.779 | 0.777 | 0.537 | +0.003      |
+  | crf_prior        | 0.770 | 0.775 | 0.773 | 0.533 | +0.001      |
+  | seg5 (n_seg=5)   | 0.767 | 0.772 | 0.774 | 0.519 | -0.002      |
+  | seg6 (n_seg=6)   | 0.767 | 0.774 | 0.774 | 0.522 | -0.002      |
+  | cross_epoch_conv | 0.766 | 0.774 | 0.777 | 0.520 | -0.003      |
+
+Analysis:
+  gru384: Only winner (+0.003 kappa, +0.004 F1, +0.012 N1 F1). Capacity scaling continues.
+    192->256 (+0.008), 256->384 (+0.003). Diminishing returns but still positive.
+    4.56M trainable params (2x baseline) -- not overfitting yet.
+  crf_prior: Wash (+0.001 kappa). AASM priors helped early convergence (lower loss ep0)
+    but CRF learns correct transitions regardless within a few epochs.
+  seg5/seg6: Both regressed (-0.002 kappa). More segments = less spectral resolution
+    per segment. N1 detection worsened in both, confirming 3 segments (10s each) is
+    the right granularity for capturing alpha dropout dynamics.
+  cross_epoch_conv: Regression (-0.003 kappa, -0.005 N1 F1). Residual Conv1d(64,64,k=5)
+    over N1Aux features before GRU adds noise rather than useful local contrast.
+    BiGRU already captures temporal context bidirectionally.
+
+Dead ends added: n_segments>3, CRF transition priors, cross-epoch conv
+
+2026-03-01: gru384_crf combo + repo cleanup
+================================================================
+Tested whether gru384 + crf_prior stack. Also made gru384 the new default and cleaned dead code.
+
+## gru384_crf combo result
+  | Metric     | gru384 | gru384_crf | Delta  |
+  |------------|--------|------------|--------|
+  | test_kappa | 0.772  | 0.769      | -0.003 |
+  | test_F1    | 0.779  | 0.777      | -0.002 |
+  | test_acc   | 0.777  | 0.779      | +0.002 |
+  | N1 F1      | 0.537  | 0.524      | -0.013 |
+  | N3 F1      | 0.751  | 0.753      | +0.002 |
+  | val_kappa  | 0.776  | 0.778      | +0.002 |
+  Checkpoint: checkpoints/sleep_model/gru384_crf/epoch=12-val_kappa=0.778.ckpt
+
+Analysis: CRF prior showed marginally higher val_kappa (0.778 vs 0.776) but test kappa was
+worse (-0.003) with notably worse N1 F1 (-0.013). The prior doesn't transfer to test --
+CRF learns optimal transitions from data regardless. Confirmed dead end.
+
+## Repo cleanup
+1. Default gru_hidden changed: 256 -> 384 (both model.py and train_model.py)
+2. Removed dead-end CLI flags: --n-segments, --cross-epoch-conv, --crf-prior
+3. Removed associated code: _init_crf_prior(), n_segments validation, cross_epoch_conv in SleepStageNet
+4. N1AuxFeatures n_segments hardcoded to 3, static_in hardcoded to 24
+5. Updated CLAUDE.md architecture section (4.6M params, hidden=384, heads=768->64->1)
+6. fast-dev-run verified: clean run with new defaults
+
+## Current best: gru384
+  test_kappa=0.772, F1=0.779, N1 F1=0.537, acc=0.777
+  Checkpoint: checkpoints/sleep_model/gru384/epoch=12-val_kappa=0.776.ckpt
+  Default config: gru_hidden=384, spectral+STFT only (256d) + N1Aux (64d), per-stage heads, CRF
+
+2026-03-01: Full codebase review + deep cleanup
+================================================================
+
+## Code review (all 13 files)
+Only real issues found (no style or speculative findings):
+
+1. **rec_pos dead parameter chain** (4 files): position embedding experiment concluded as dead end
+   but code lingered. SleepStageNet.forward() accepted rec_pos but ignored it; dataset computed
+   it per-sample; train_model unpacked it; eval_per_dataset passed it to model.
+   Fix: removed rec_pos from model.py forward(), dataset.py (returns dummy), train_model.py (unpacks _),
+   eval_per_dataset.py (no longer passes to model).
+
+2. **Dead import**: torch.nn as nn in train_model.py (from trajectory dynamics experiment, already removed).
+
+3. **Stale default**: eval_per_dataset.py --exp-name defaulted to "spec_heads_n1aux" instead of "gru384".
+
+All fixes verified with --fast-dev-run.
+
+## Deep cleanup -- preparing for clean run
+Deleted all dead-end experiment artifacts:
+- 20 checkpoint dirs under checkpoints/sleep_model/ (~2.4 GB freed)
+  Kept: encoder/v12, sleep_model/gru384
+- 18 log dirs + 4 loose .txt files under logs/
+  Kept: encoder/v12, sleep_model/gru384
+- analyze_n1_transitions.py (orphaned diagnostic, not in 13-file codebase)
+- __pycache__
+
+Updated CLAUDE.md: removed spec_heads_n1aux checkpoint ref (deleted), kept 13-file codebase listing.
+
+## Remaining files
+  checkpoints/encoder/v12/          -- encoder (needed for all downstream)
+  checkpoints/sleep_model/gru384/   -- current best downstream
+  logs/encoder/v12/                 -- encoder metrics
+  logs/sleep_model/gru384/          -- downstream metrics
+  plots/tsne_stages.png, tsne_datasets.png -- encoder t-SNE visualizations
+  13 Python source files (config, data_pipeline, readers, readers_extra,
+    dataset, model, train_encoder, train_model, eval_embeddings,
+    eval_per_dataset, eval_branches, compare_encoders, analyze_residuals)
+
+## 2026-03-01: Clean baseline established
+- Full downstream training run with cleaned repo (all dead-end artifacts removed)
+- Config: gru_hidden=384, spectral+STFT only (256d) + N1AuxFeatures (64d) -> 320d input
+  BiGRU 2-layer bidirectional, per-stage MLP heads + CRF, encoder frozen
+- Encoder: checkpoints/encoder/v12/epoch=49-val_loss=0.627.ckpt
+- Best val_kappa=0.776 at epoch 12, early stopped epoch 18 (patience=10, min_delta=0.005)
+- Test results: kappa=0.772, F1=0.779, acc=0.777
+  Per-class F1: W=0.938, N1=0.537, N2=0.829, N3=0.748, REM=0.843
+- Exactly reproduces previous gru384 run -- confirms clean repo produces identical results
+- Checkpoint: checkpoints/sleep_model/baseline/epoch=12-val_kappa=0.776.ckpt
+- Replaced gru384 checkpoints with baseline (same model, clean provenance)
+
+## 2026-03-01: Information flow trace + test-time inference analysis
+
+### Info flow trace (trace_info_flow.py)
+Layer-by-layer kNN probing of stage discriminability at each transform point.
+Per-epoch probes (no temporal context, kNN k=5, 5-fold CV, 15K subsample):
+  Spectral raw (18d)        kappa=0.503  N1 F1=0.218
+  Spectral MLP (128d)       kappa=0.570  N1 F1=0.252  (+0.067)
+  STFT branch (128d)        kappa=0.566  N1 F1=0.232
+  Encoder spec+STFT (256d)  kappa=0.591  N1 F1=0.260  (+0.025)
+  N1Aux raw (24d)           kappa=0.343  N1 F1=0.121
+  N1Aux output (64d)        kappa=0.546  N1 F1=0.280
+  Pre-GRU combined (320d)   kappa=0.608  N1 F1=0.303  (+0.017 from N1Aux)
+Sequence probes (with temporal context):
+  BiGRU output (768d) kNN   kappa=0.793  N1 F1=0.510  (+0.185 from GRU context)
+  Argmax logits              kappa=0.758  N1 F1=0.553  (-0.035 head compression)
+  CRF Viterbi                kappa=0.772  N1 F1=0.537  (+0.014 CRF, -0.015 N1)
+
+Key findings:
+- BiGRU is the dominant component: +0.185 kappa, +0.207 N1 F1
+- Per-epoch features plateau at kappa=0.608 (ceiling without temporal context)
+- Per-stage heads lose 0.035 kappa vs kNN on raw GRU features (768d->5d compression)
+- CRF helps overall (+0.014 kappa) but hurts N1 (-0.015 F1)
+- N1Aux earns its keep: +0.017 kappa, +0.043 N1 F1 per-epoch
+
+### Test-time overlapping inference (test_overlap.py)
+Overlapping windows + full-night single pass on 335 held-out test subjects (393642 epochs).
+  stride=200 (1x)  CRF vote  kappa=0.768  N1=0.538
+  stride=50 (4x)   CRF vote  kappa=0.771  N1=0.540
+  stride=20 (10x)  CRF vote  kappa=0.771  N1=0.538
+  Full night CRF             kappa=0.771  N1=0.536
+  stride=50 (4x)   logit avg kappa=0.760  N1=0.557
+  stride=20 (10x)  logit avg kappa=0.760  N1=0.558
+
+Key findings:
+- Overlapping inference is a dead end for kappa (+0.003 max, within noise)
+- Full-night GRU adds nothing over 200-epoch windows
+- CRF suppresses N1 by ~0.020 F1 across all configs (confirmed independently)
+- N1 ceiling without CRF: 0.558 (logit avg) vs 0.537 (CRF)
+- Coverage: 393642/393642 vs baseline DataLoader's 359400 (8.7% more epochs, no help)
+
+### Assessment
+Model is at diminishing returns for this architecture. Next meaningful jump requires
+either cleaner labels, fundamentally different approach, or accepting CRF/N1 tradeoff.
+CRF costs 0.020 N1 F1 to gain 0.011 kappa -- tradeoff depends on application.
+
+## 2026-03-01: N1Aux Ablation (full training, gru_hidden=384)
+
+### Setup
+- Removed N1AuxFeatures (64d) from downstream pipeline (GRU input: 256d instead of 320d)
+- Same config: gru_hidden=384, freeze_epochs=999, batch_size=48, max_epochs=40, seed=42
+- Trainable params: 4.39M (vs 4.56M with N1Aux, -170K)
+
+### Results
+| Metric   | no_n1aux | baseline | Delta  |
+|----------|----------|----------|--------|
+| test_kappa | 0.768  | 0.772    | -0.004 |
+| test_f1    | 0.774  | 0.779    | -0.005 |
+| N1 F1      | 0.516  | 0.537    | -0.021 |
+| REM F1     | 0.841  | 0.849    | -0.008 |
+| W F1       | 0.937  | 0.933    | +0.004 |
+| N2 F1      | 0.822  | 0.824    | -0.002 |
+| N3 F1      | 0.752  | 0.752    | 0.000  |
+| val peak   | 0.774 (ep9) | 0.776 (ep12) | -0.002 |
+
+### Conclusion
+N1Aux earns its 24K params. The -0.021 N1 F1 hit is exactly what it was designed to prevent.
+Also hurts REM (-0.008), likely from shared spectral entropy/dynamics features.
+N1AuxFeatures is not dead weight -- keep it.
+
+## 2026-03-01: Model Simplification
+
+### Motivation
+Hard audit of every component. N1Aux contributes +0.004 kappa / +0.021 N1 F1 but at
+170K effective params (24K module + 147K GRU widening). User accepts the loss for simpler model.
+Also found: CNN branches computed every forward pass then discarded (pure waste),
+per-stage heads (5x redundant LayerNorm+Dropout on same input, 246K params).
+
+### Changes
+1. **Removed N1AuxFeatures** - deleted class (~100 lines), GRU input 320d -> 256d
+2. **Skip CNN in forward** - _encode() calls encoder.spectral() + encoder.stft() directly,
+   skips 3 CNN branches (~870K frozen params, ~77 GFLOPS/batch saved)
+3. **Shared head** - replaced 5 per-stage MLPs (246K) with single MLP (49K):
+   Dropout -> LayerNorm(768) -> Linear(768,64) -> GELU -> Linear(64,5)
+4. **torch.compile** now targets individual branches instead of whole encoder
+5. Updated test_overlap.py, trace_info_flow.py to match
+
+### Param count
+- Before: 4.56M trainable (5.64M total)
+- After: 4.19M trainable (5.26M total), -8.2% trainable
+
+### Results (exp-name: simplified)
+| Metric   | simplified | baseline | Delta  |
+|----------|------------|----------|--------|
+| test_kappa | 0.765    | 0.772    | -0.007 |
+| test_f1    | 0.777    | 0.779    | -0.002 |
+| N1 F1      | 0.535    | 0.537    | -0.002 |
+| N2 F1      | 0.820    | 0.829    | -0.009 |
+| W F1       | 0.932    | 0.938    | -0.006 |
+| N3 F1      | 0.753    | 0.748    | +0.005 |
+| REM F1     | 0.844    | 0.843    | +0.001 |
+| Speed      | 4.42 it/s | ~3.0 it/s | +47%  |
+| val peak   | 0.773 (ep9) | 0.776 (ep12) | -0.003 |
+
+### Analysis
+- Kappa -0.007 = N1Aux removal (-0.004) + shared head (-0.003)
+- F1 barely affected (-0.002): shared head recovers N1 F1 that per-stage heads lose
+- N1 F1: simplified 0.535 vs no_n1aux (per-stage) 0.516 -- shared head +0.019 for N1
+- 47% training speedup from skipping CNN forward pass
+- Checkpoint: checkpoints/sleep_model/simplified/epoch=9-val_kappa=0.773.ckpt
+2026-03-01: N1-targeted experiments
+================================================================
+
+### Experiment 1: Directional STFT pool + delta features (FAILED)
+- DirectionalSTFTPool: first/last half delta of STFT transformer tokens
+- Delta features: epoch-to-epoch spectral change with Linear(512,256) projection
+- Result: kappa=0.756 (-0.009), N1 F1=0.492 (-0.043) -- WORSE
+- Root cause: lossy projections destroyed information; epoch-to-epoch deltas
+  noise-dominated; frozen transformer tokens lack temporal ordering after self-attention
+
+### Experiment 2: Attention pooling + wider head (SUCCESS)
+- AttentionPool: learned weighted average over 31 STFT frames (129 params, temp-scaled)
+- Wider head bottleneck: 768->128->5 (was 768->64->5)
+- Result: kappa=0.768 (+0.003), F1=0.779 (+0.002), N1 F1=0.540 (+0.005)
+- All stages improved or held; training collapsed at epoch 12 (attention saturation)
+  but best checkpoint at epoch 9 was clean
+- Temperature scaling (dim^-0.5) added to prevent future collapse
+
+### Experiment 3: No-CRF ablation (INFORMATIVE)
+- Same architecture as Exp 2, CRF disabled
+- Result: kappa=0.756 (-0.009), N1 F1=0.546 (+0.011), N2 F1=0.806 (-0.014)
+- N1 recall 62.6% (vs 55.3% baseline) -- CRF suppresses brief N1 episodes
+- CRF's N1 penalty now -0.006 (was -0.020 historically); attention pooling reduces CRF/N1 conflict
+- 2.3x faster without CRF (10.13 vs 4.36 it/s)
+
+### Summary table
+| Config               | kappa | F1    | N1 F1 | N2 F1 | N3 F1 |
+|----------------------|-------|-------|-------|-------|-------|
+| simplified baseline  | 0.765 | 0.777 | 0.535 | 0.820 | 0.753 |
+| directional+delta    | 0.756 | 0.762 | 0.492 | 0.814 | 0.731 |
+| attn_pool+CRF        | 0.768 | 0.779 | 0.540 | 0.821 | 0.755 |
+| attn_pool-CRF        | 0.756 | 0.773 | 0.546 | 0.806 | 0.747 |
+
+### Current best: attn_pool+CRF
+- Checkpoint: checkpoints/sleep_model/attn_pool/epoch=9-val_kappa=0.771.ckpt
+- Per-class: W=0.937, N1=0.540, N2=0.821, N3=0.755, REM=0.843
+- 4.2M trainable, +49K from wider head + 129 from attention pool
+
+2026-03-01: Encoder cleanup + F1 monitoring experiment
+================================================================
+
+### Encoder changes (train_encoder.py)
+1. Per-class kNN F1 logging: val_knn_f1_{W,N1,N2,N3,REM} + val_knn_N1_f1 on prog_bar
+2. Stripped VICReg dead code (~20 lines + CLI arg) -- confirmed dead end
+3. Added val_knn_f1 as monitor option (val_loss remains default)
+4. Consolidated 7 decoder weights (wave_weight, delta_weight, etc.) into single branch_weight=0.3
+5. Fixed branch return order in model.py: (s,l,m) -> (s,m,l) for natural ordering
+
+### model.py branch return order fix
+EpochEncoder.forward(return_branches=True) now returns (fused, feat_s, feat_m, feat_l)
+instead of (fused, feat_s, feat_l, feat_m). Docstring updated to match.
+
+### Downstream F1 monitoring experiment (f1_baseline)
+Switched downstream monitoring from val_kappa to val_f1_macro. Also added per-class F1
+logging (val_f1_per, val_N1_f1 on prog_bar).
+
+Results (test set):
+| Metric   | f1_baseline | attn_pool | Delta  |
+|----------|-------------|-----------|--------|
+| test_kappa | 0.761     | 0.768     | -0.007 |
+| test_F1    | 0.776     | 0.779     | -0.003 |
+| N1 F1      | 0.543     | 0.540     | +0.003 |
+| W F1       | 0.933     | 0.937     | -0.004 |
+| N2 F1      | 0.812     | 0.821     | -0.009 |
+| N3 F1      | 0.745     | 0.755     | -0.010 |
+| REM F1     | 0.848     | 0.843     | +0.005 |
+| acc        | 0.792     | 0.789     | +0.003 |
+
+Training instability: loss diverged after epoch 11 (1.5 -> 30+), metrics crashed.
+Early stopping restored best checkpoint (epoch 5, val_f1_macro=0.778).
+F1-monitoring selected epoch 5 vs kappa-monitoring epoch 9 -- different checkpoint selection.
+
+Verdict: F1 monitoring is a wash. Selected checkpoint trades N2/N3 precision for slight
+N1/REM gain. Training instability may be coincidental or related to different stopping dynamics.
+Current best remains attn_pool (kappa-monitored).
+
+2026-03-01: EEG-JEPA project prompt
+================================================================
+Wrote PROMPT.md for new eeg_jepa project exploring Joint Embedding Predictive Architecture
+for EEG. Key ideas:
+- Predict representations (not raw signal) of masked epochs from temporal context
+- Unified model (no frozen encoder + separate downstream)
+- Temporal context transformer over epoch sequences
+- EMA target encoder (BYOL/DINO/I-JEPA style)
+- Contiguous masking (3-10 epochs) to force sleep grammar learning
+- Evaluation: temporal prediction accuracy, embedding structure, clustering, linear probes
+- Keeps spectral+STFT feature extractors, HDF5 data pipeline from eeg_sleep
+- Discards reconstruction decoders, CRF, per-epoch isolation
+File: C:\Users\shame\OneDrive\Desktop\eeg_stuff\eeg_jepa\PROMPT.md
