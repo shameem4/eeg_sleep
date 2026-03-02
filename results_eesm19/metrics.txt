@@ -1,0 +1,26 @@
+Dataset: ds005185-download
+Recordings: 5
+Labeled epochs: 3583
+Total epochs: 4532
+Cohen's kappa: 0.7632
+Macro F1: 0.7878
+Accuracy: 0.8328
+
+Per-stage F1:
+  W: 0.810
+  N1: 0.549
+  N2: 0.857
+  N3: 0.870
+  REM: 0.854
+
+              precision    recall  f1-score   support
+
+           W       0.95      0.71      0.81       304
+          N1       0.54      0.56      0.55       259
+          N2       0.86      0.85      0.86      1620
+          N3       0.83      0.92      0.87       708
+         REM       0.85      0.86      0.85       692
+
+    accuracy                           0.83      3583
+   macro avg       0.80      0.78      0.79      3583
+weighted avg       0.84      0.83      0.83      3583

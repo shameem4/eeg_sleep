@@ -110,7 +110,7 @@ Sanitize caches: `python data_pipeline.py --sanitize` (or `--audit` for dry run)
 | BranchDecoder (slowwave) | large CNN 128d | bandpass 0.5-1 Hz signed, 8x ds | 480 | 65K |
 | BranchDecoder (sawtooth) | medium CNN 128d | bandpass 2-6 Hz signed, 8x ds | 480 | 65K |
 
-## Codebase (10 files)
+## Codebase (11 files)
 | File | Purpose |
 |------|---------|
 | config.py | Paths, constants, 17-dataset registry |
@@ -121,5 +121,6 @@ Sanitize caches: `python data_pipeline.py --sanitize` (or `--audit` for dry run)
 | model.py | EpochEncoder + SleepStageNet + recon decoders |
 | train_encoder.py | Self-supervised encoder training (reconstruction, no labels) |
 | train_model.py | Frozen encoder + BiGRU + shared head + CRF downstream |
+| inference.py | End-to-end inference on any BIDS dataset (EDF/SET -> predictions + metrics + plots) |
 | eval_embeddings.py | Embedding quality metrics |
 | eval_per_dataset.py | Per-dataset/device evaluation |
